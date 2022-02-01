@@ -64,20 +64,36 @@
 // Defines
 //
 #define RESULTS_BUFFER_SIZE     256
+#define N_r 5000.0 // aka TBPRD; 5000 --> 10 kHz || 50,000 --> f_1 = f_PWM = 1 kHz & f_SAMP = 2 kHz --> Nyquist freq = 2 kHz
+#define pi 3.141592653589
+
+// NOTES:
+// f_1 = 1 kHz
+// Nyquist freq = 2 * f_1 = 2 kHz
 
 //
 // Globals
 //
+
 uint16_t adcAResults[RESULTS_BUFFER_SIZE];   // Buffer for results
 uint16_t index;                              // Index into result buffer
 volatile uint16_t bufferFull;                // Flag to indicate buffer is full
 
-float duty = 0.5;
+uint16_t temp_ADC = 0;
+float duty = 1; // duty cycle
+float dt = 0.0;
+float Wn = 100*2*pi; // 100*2*pi/90.9; // angular frequency
+float m = 0.5;
+
+float fsamp = 20000; // 220
+float Ts = 0;
+
 
 //
 // Function Prototypes
 //
 void initADC(void);
+void initDAC(void);
 void initEPWM(void);
 void initADCSOC(void);
 __interrupt void adcA1ISR(void);
@@ -139,6 +155,11 @@ void main(void)
     initEPWM();
 
     //
+    // Configure the DAC and power it up
+    //
+    initDAC();
+
+    //
     // Setup the ADC for ePWM triggered conversions on channel 1
     //
     initADCSOC();
@@ -180,7 +201,8 @@ void main(void)
     {
 
         // TOEDIT
-        EPwm1Regs.CMPA.bit.CMPA = duty * 5000;
+        EPwm1Regs.CMPA.bit.CMPA = duty * N_r;
+
 
     }
 }
@@ -200,7 +222,7 @@ void initADC(void)
     //
     // Set ADCCLK divider to /4
     //
-    AdcaRegs.ADCCTL2.bit.PRESCALE = 6;
+    AdcaRegs.ADCCTL2.bit.PRESCALE = 0; // 0000: ADCCLK = Input Clock / 1.0
 
     //
     // Set pulse positions to late
@@ -255,7 +277,7 @@ void initEPWM(void)
      */
 
     // Time-Based Period --> determines the period of the time-base counter --> sets the PWM frequency
-    EPwm1Regs.TBPRD = 5000;
+    EPwm1Regs.TBPRD = N_r;
 
 
     /////////////////////////////////////////////
@@ -264,7 +286,7 @@ void initEPWM(void)
 
     // AQCTLA --> Action Qualifier Control for group A
         // CAU --> CMPA on Up-count --> Action when TBCTR = CMPA on up count (compare with value stored in register A on up-count)
-    EPwm1Regs.AQCTLA.bit.CAU - 0b01;    // 0b11: Toggle EPWMxA output (low forced high & high forced low) || 0b01: Clear: force EPWMxA output low
+    EPwm1Regs.AQCTLA.bit.CAU = 0b01;    // 0b11: Toggle EPWMxA output (low forced high & high forced low) || 0b01: Clear: force EPWMxA output low
         // CAD --> CMPA on Down-count --> Action when TBCTR = CMPA on down count (compare with value stored in register A on down-count)
     EPwm1Regs.AQCTLA.bit.CAD = 0b10;    // 0b11: Toggle EPWMxA output (low forced high & high forced low) || 0b10: Set: force EPWMxA output high.
 
@@ -320,11 +342,13 @@ void initEPWM(void)
     // GPIO A Peripheral Mux (GPIO0 to GPIO15)
         //
     GpioCtrlRegs.GPAMUX1.bit.GPIO0 = 1;
+        //
     GpioCtrlRegs.GPAMUX1.bit.GPIO1 = 1;
 
     // GPIO A Pull-Up Disable (GPIO0 to GPIO31)
-        // Disable Pull-up Resistor for GPIO A, pin 1 TODO --> is this the right way to say this?
+        // Disable Pull-up Resistor for GPIO A, pin 0
     GpioCtrlRegs.GPAPUD.bit.GPIO0 = 0b1;
+        // Disable Pull-up Resistor for GPIO A, pin 1
     GpioCtrlRegs.GPAPUD.bit.GPIO1 = 0b1;
 
     // Emulation Disable --> disable write access to protected space (i.e., protected registers)
@@ -342,18 +366,65 @@ void initADCSOC(void)
     //
     EALLOW;
 
-    AdcaRegs.ADCSOC0CTL.bit.CHSEL = 1;     // SOC0 will convert pin A1
-                                           // 0:A0  1:A1  2:A2  3:A3
-                                           // 4:A4   5:A5   6:A6   7:A7
-                                           // 8:A8   9:A9   A:A10  B:A11
-                                           // C:A12  D:A13  E:A14  F:A15
-    AdcaRegs.ADCSOC0CTL.bit.ACQPS = 9;     // Sample window is 10 SYSCLK cycles
-    AdcaRegs.ADCSOC0CTL.bit.TRIGSEL = 5;   // Trigger on ePWM1 SOCA
+//    AdcaRegs.ADCSOC0CTL.bit.CHSEL = 1;     // SOC0 will convert pin A1
+//                                           // 0:A0  1:A1  2:A2  3:A3
+//                                           // 4:A4   5:A5   6:A6   7:A7
+//                                           // 8:A8   9:A9   A:A10  B:A11
+//                                           // C:A12  D:A13  E:A14  F:A15
+//    AdcaRegs.ADCSOC0CTL.bit.ACQPS = 9;     // Sample window is 10 SYSCLK cycles
+//    AdcaRegs.ADCSOC0CTL.bit.TRIGSEL = 5;   // Trigger on ePWM1 SOCA
 
-    // TODO: edit next 3 lines
+    /////////////////////////////////////////////
+    // ADC SOC CONFIGURATION
+    /////////////////////////////////////////////
+
+    // Channel Select --> Specify SOC module for each ADC channel in use
+        // SOC 0 will convert ADCINA3 (i.e., ADC A, channel 3)
+    AdcaRegs.ADCSOC0CTL.bit.CHSEL = 3; // 3h ADCIN3
+        // SOC 1 will convert ADCINA5 (i.e., ADC A, channel 5)
+    AdcaRegs.ADCSOC1CTL.bit.CHSEL = 5; // 5h ADCIN5
+        // SOC 2 will convert ADCINA6 (i.e., ADC A, channel 6)
+    AdcaRegs.ADCSOC2CTL.bit.CHSEL = 6; // 6h ADCIN6
+
+    // Acquisition Pre-scale --> Sample and hold window of SOC modules
+    AdcaRegs.ADCSOC0CTL.bit.ACQPS = 9; // 009h Sample window is 9 system clock cycles wide
+    AdcaRegs.ADCSOC1CTL.bit.ACQPS = 9; // 009h Sample window is 9 system clock cycles wide
+    AdcaRegs.ADCSOC2CTL.bit.ACQPS = 9; // 009h Sample window is 9 system clock cycles wide
+
+    // Trigger Select --> Determines which trigger will initiate a conversion
+    AdcaRegs.ADCSOC0CTL.bit.TRIGSEL = 5; // 05h: ADCTRIG5 - ePWM1, ADCSOCA
+    AdcaRegs.ADCSOC1CTL.bit.TRIGSEL = 5; // 05h: ADCTRIG5 - ePWM1, ADCSOCA
+    AdcaRegs.ADCSOC2CTL.bit.TRIGSEL = 5; // 05h: ADCTRIG5 - ePWM1, ADCSOCA
+
+    /////////////////////////////////////////////
+    // INTERRUPT CONFIGURATION
+    /////////////////////////////////////////////
+
     AdcaRegs.ADCINTSEL1N2.bit.INT1SEL = 0; // End of SOC0 will set INT1 flag
     AdcaRegs.ADCINTSEL1N2.bit.INT1E = 1;   // Enable INT1 flag
     AdcaRegs.ADCINTFLGCLR.bit.ADCINT1 = 1; // Make sure INT1 flag is cleared
+
+    EDIS;
+}
+
+
+void initDAC(void)
+{
+    EALLOW;
+
+    // DAC Control
+        // DAC reference select --> Selects which voltage references are used by the DAC
+    DacaRegs.DACCTL.bit.DACREFSEL = 0b1; // 1 ADC VREFHI/VSSA are the reference voltages
+        // Determines when the DACVALA register is updated with the value from DACVALS.
+    DacaRegs.DACCTL.bit.LOADMODE = 0b0;  // 0 Load on next SYSCLK
+        // DAC gain mode select. Selects the gain mode for the buffered output
+    DacaRegs.DACCTL.bit.MODE = 0b1; // 1 Gain is 2
+
+    // DAC Output Enable Register
+    DacaRegs.DACOUTEN.bit.DACOUTEN = 0b1; // 1 DAC output is enabled
+
+    // DAC Value Register - Shadow
+    DacaRegs.DACVALS.all = 0; // Shadow output code to be loaded into DACVALA
 
     EDIS;
 }
@@ -368,6 +439,10 @@ __interrupt void adcA1ISR(void)
     // ADCRESULT0 is the result register of SOC0
     adcAResults[index++] = AdcaResultRegs.ADCRESULT0;
 
+    // CUSTOM ASSIGNMENT
+    temp_ADC = AdcaResultRegs.ADCRESULT0;
+    DacaRegs.DACVALS.all = temp_ADC;
+
     //
     // Set the bufferFull flag if the buffer is full
     //
@@ -376,6 +451,20 @@ __interrupt void adcA1ISR(void)
         index = 0;
         bufferFull = 1;
     }
+
+    // CUSTOM CODE
+
+    Ts = 1/fsamp;
+
+    dt = dt + Ts;
+    if (0.5 * Wn*dt >= 2*pi){
+        dt=0;
+    }
+    duty = 0.5*(1 + m*cos(0.5*Wn*dt));
+
+    EPwm1Regs.CMPA.bit.CMPA = duty * N_r;
+
+    // CUSTOM CODE
 
     //
     // Clear the interrupt flag
