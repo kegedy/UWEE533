@@ -1,0 +1,787 @@
+//#############################################################################
+//
+// FILE:   adc_ex1_soc_epwm.c
+//
+// TITLE:  ADC ePWM Triggering
+//
+//! \addtogroup bitfield_example_list
+//! <h1>ADC ePWM Triggering</h1>
+//!
+//! This example sets up ePWM1 to periodically trigger a conversion on ADCA.
+//!
+//! \b External \b Connections \n
+//!  - A1 should be connected to a signal to convert
+//!
+//! \b Watch \b Variables \n
+//! - \b adcAResults - A sequence of analog-to-digital conversion samples from
+//!   pin A1. The time between samples is determined based on the period
+//!   of the ePWM timer.
+//!
+//
+//#############################################################################
+// $TI Release: F28004x Support Library v1.08.00.00 $
+// $Release Date: Mon Dec 23 17:24:05 IST 2019 $
+// $Copyright:
+// Copyright (C) 2019 Texas Instruments Incorporated - http://www.ti.com/
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+//
+//   Redistributions of source code must retain the above copyright
+//   notice, this list of conditions and the following disclaimer.
+//
+//   Redistributions in binary form must reproduce the above copyright
+//   notice, this list of conditions and the following disclaimer in the
+//   documentation and/or other materials provided with the
+//   distribution.
+//
+//   Neither the name of Texas Instruments Incorporated nor the names of
+//   its contributors may be used to endorse or promote products derived
+//   from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// $
+//#############################################################################
+
+//
+// Included Files
+//
+#include "F28x_Project.h"
+#include "math.h"
+//
+// Defines
+//
+//#define RESULTS_BUFFER_SIZE     256
+
+#define pi 3.141592653589f
+#define Tsamp 0.0001f
+#define al 2.094395102393195f
+#define N 5000
+//
+// Globals
+//
+float duty = 0.5;// duty ratio
+//float N = 5000;
+// R23 = 120e-3;
+float L23 = 235.0e-6;
+// KP = 2*pi*5000*L23
+// KI = 2*pi*5000*R23
+float I =0;
+float Isd;
+float Isq;
+float Isa;
+float Isb;
+float Isc;
+float Vout = 0;
+float Vin  =50;
+float th_act;
+//uint16_t adcAResults[RESULTS_BUFFER_SIZE];   // Buffer for results
+//uint16_t index;                              // Index into result buffer
+//volatile uint16_t bufferFull;                // Flag to indicate buffer is full
+
+uint16_t ConversionCount;
+uint16_t Graph1[10];
+uint16_t Graph2[10];
+float wt;
+float mod_index = 0.4;
+float KP = 0.7751;//0.62832;
+float KI = 371.0629;//376.99;
+float Kpc = 0.1565;
+float Kic = 86.0294; //2*pi*0.1565*87.48887
+float KP_omega = 42.46; // 2*pi*60*Jnet
+float KI_omega = 0.3768; // 2*pi*60*Bnet
+float omega_ref = 10; // mechanical speed
+float ec[2];
+float ev[2];
+float yc[2];
+float yv[2];
+float th[2];
+float eIsd[2];
+float eIsq[2];
+float yIsd[2];
+float yIsq[2];
+
+float e_omega[2];
+float y_omega[2];
+
+float vsd;
+float vsq;
+float vsa;
+float vsb;
+float vsc;
+float Isdref = 8;
+float Isqref = 10;
+float Iref =5;
+float Vref =48;
+float w_est[2];
+int k = 1;
+int sector[2];
+int counter = 0;
+float angle;
+float w_e;
+static int HallLookup[8] = {
+        0, // bad reading
+        5, // 1 Sector
+        3, // 2
+        4, // 3
+        1, // 4
+        6, // 5
+        2, // 6
+        0  // bad reading
+};
+int counter2;
+float Imax = 100;
+//
+// Function Prototypes
+//
+void initADC(void);
+void initEPWM(void);
+void initADCSOC(void);
+void setup1GPIO(void);
+__interrupt void adcA1ISR(void);
+//float PIController(float Kp,float Ki, float ref,float val);
+//
+// Main
+//
+void main(void)
+{
+    //
+    // Initialize device clock and peripherals
+    //
+    InitSysCtrl();
+
+    //
+    // Initialize GPIO
+    //
+    InitGpio();
+
+    //
+    // Disable CPU interrupts
+    //
+    DINT;
+
+    //
+    // Initialize the PIE control registers to their default state.
+    // The default state is all PIE interrupts disabled and flags
+    // are cleared.
+    //
+    InitPieCtrl();
+
+    //
+    // Disable CPU interrupts and clear all CPU interrupt flags:
+    //
+    IER = 0x0000;
+    IFR = 0x0000;
+
+    //
+    // Initialize the PIE vector table with pointers to the shell Interrupt
+    // Service Routines (ISR).
+    //
+    InitPieVectTable();
+
+    //
+    // Map ISR functions
+    //
+    EALLOW;
+    PieVectTable.ADCA1_INT = &adcA1ISR;     // Function for ADCA interrupt 1
+    EDIS;
+
+    //
+    // Configure the ADC and power it up
+    //
+    initADC();
+
+    //
+    // Configure the ePWM
+    //
+    initEPWM();
+
+    //
+    // Setup the ADC for ePWM triggered conversions on channel 1
+    //
+    initADCSOC();
+
+    //
+    // Enable global Interrupts and higher priority real-time debug events:
+    //
+    IER |= M_INT1;  // Enable group 1 interrupts
+
+    EINT;           // Enable Global interrupt INTM
+    ERTM;           // Enable Global realtime interrupt DBGM
+
+    //
+    // Initialize results buffer
+    //
+
+
+ //   index = 0;
+ //   bufferFull = 0;
+
+    //
+    // Enable PIE interrupt
+    //
+    PieCtrlRegs.PIEIER1.bit.INTx1 = 1;
+
+    //
+    // Sync ePWM
+    //
+    EALLOW;
+    CpuSysRegs.PCLKCR0.bit.TBCLKSYNC = 1;
+    EALLOW;
+        DacaRegs.DACCTL.bit.DACREFSEL = 1;
+        DacaRegs.DACCTL.bit.MODE = 1;
+        DacaRegs.DACCTL.bit.LOADMODE = 0;
+        DacaRegs.DACOUTEN.bit.DACOUTEN = 1;
+        DacaRegs.DACVALS.all = 0;
+        DELAY_US(10);
+    EDIS;
+    //
+    // Take conversions indefinitely in loop
+    //
+   setup1GPIO();
+
+    // Define the error vectors
+  /*  ec[0] = 0;
+    ec[1] = 0;
+    ev[0] = 0;
+    ev[1] = 0;
+    yc[0] = 0;
+    yc[1] = 0;
+    yv[0] = 0;
+    yv[1] = 0;*/
+    th[0] = 0;
+    th[1] = 0;
+    e_omega[k-1] =0;
+   e_omega[k] = 0;
+    y_omega[k-1] = 0;
+    y_omega[k] = 0;
+
+    while(1)
+    {
+        //
+        // Start ePWM
+        //
+//        EPwm1Regs.ETSEL.bit.SOCAEN = 1;    // Enable SOCA
+
+    }
+}
+
+//
+// initADC - Function to configure and power up ADCA.
+//
+void initADC(void)
+{
+    //
+    // Setup VREF as internal
+    //
+    SetVREF(ADC_ADCA, ADC_INTERNAL, ADC_VREF3P3);
+    SetVREF(ADC_ADCC, ADC_INTERNAL, ADC_VREF3P3);
+
+    EALLOW;
+    // Set ADCCLK divider to /4
+    //
+    AdcaRegs.ADCCTL2.bit.PRESCALE = 6;
+    AdccRegs.ADCCTL2.bit.PRESCALE = 6;
+    //
+    // Set pulse positions to late
+    //
+    AdcaRegs.ADCCTL1.bit.INTPULSEPOS = 1;
+
+    //
+    // Power up the ADC and then delay for 1 ms
+    //
+    AdcaRegs.ADCCTL1.bit.ADCPWDNZ = 1;
+    AdccRegs.ADCCTL1.bit.ADCPWDNZ = 1;   // Powers up all the analog circuits inside the ADC
+    EDIS;
+
+    DELAY_US(1000);
+}
+
+//
+// initEPWM - Function to configure ePWM1 to generate the SOC.
+//
+void initEPWM(void)
+{
+    EALLOW;
+
+    EPwm1Regs.ETSEL.bit.SOCAEN = 1;     // Enable SOC on A group
+    EPwm1Regs.ETSEL.bit.SOCASEL = 1;    // Select SOC when TBCTR = PRD or ZERO
+    EPwm1Regs.ETPS.bit.SOCAPRD = 1;     // Generate pulse on 1st event
+    EPwm1Regs.ETPS.bit.INTPRD = ET_1ST;              // generate interrupt once for each PWM cycle
+
+
+    EPwm1Regs.TBPRD = N; //period-1;             // PWM frequency = 1 / period
+    EPwm1Regs.CMPA.bit.CMPA = duty*N;   // set duty 50% initially
+
+    EPwm1Regs.TBCTL.bit.CTRMODE = TB_COUNT_UPDOWN;
+
+    EPwm1Regs.TBCTL.bit.HSPCLKDIV = TB_DIV1;
+    EPwm1Regs.TBCTL.bit.CLKDIV = TB_DIV1;
+
+    EPwm1Regs.AQCTLA.bit.CAU = AQ_CLEAR;        //EPWM1A goes low when CTR=CMPA register when CTR decrementing
+    EPwm1Regs.AQCTLA.bit.CAD = AQ_SET;          //EPWM1A goes hi when CTR=CMPA register when CTR incrementing
+
+    //Deadband settings
+    EPwm1Regs.DBCTL.bit.IN_MODE =0x0; // ePWM-A for both RED and FED
+    EPwm1Regs.DBCTL.bit.OUT_MODE = DB_FULL_ENABLE; // enable Dead-band module
+    EPwm1Regs.DBCTL.bit.POLSEL = DB_ACTV_HIC; // active Hi complementary
+    EPwm1Regs.DBFED.all = 10; //Falling edge delay - based on sysclk (ePWM table 2-14)
+    EPwm1Regs.DBRED.all = 10; //Rising edge delay - based on sysclk (ePWM table
+
+    // Motor PWM
+
+    EPwm2Regs.TBPRD = N; //period-1;             // PWM frequency = 1 / period
+    EPwm2Regs.CMPA.bit.CMPA = duty*N;   // set duty 50% initially
+
+    EPwm2Regs.TBCTL.bit.CTRMODE = TB_COUNT_UPDOWN;
+
+    EPwm2Regs.TBCTL.bit.HSPCLKDIV = TB_DIV1;
+    EPwm2Regs.TBCTL.bit.CLKDIV = TB_DIV1;
+
+    EPwm2Regs.AQCTLA.bit.CAU = AQ_CLEAR;        //EPWM1A goes low when CTR=CMPA register when CTR decrementing
+    EPwm2Regs.AQCTLA.bit.CAD = AQ_SET;          //EPWM1A goes hi when CTR=CMPA register when CTR incrementing
+    EPwm2Regs.AQCTLA.bit.ZRO = 0;
+    EPwm2Regs.AQCTLA.bit.PRD = 0;
+    //Deadband settings
+    EPwm2Regs.DBCTL.bit.IN_MODE =0x0; // ePWM-A for both RED and FED
+    EPwm2Regs.DBCTL.bit.OUT_MODE = DB_FULL_ENABLE; // enable Dead-band module
+    EPwm2Regs.DBCTL.bit.POLSEL = DB_ACTV_HIC; // active Hi complementary
+    EPwm2Regs.DBFED.all = 10; //Falling edge delay - based on sysclk (ePWM table 2-14)
+    EPwm2Regs.DBRED.all = 10; //Rising edge delay - based on sysclk (ePWM table
+
+    EPwm3Regs.TBPRD = N; //period-1;             // PWM frequency = 1 / period
+    EPwm3Regs.CMPA.bit.CMPA = duty*N;   // set duty 50% initially
+
+    EPwm3Regs.TBCTL.bit.CTRMODE = TB_COUNT_UPDOWN;
+
+    EPwm3Regs.TBCTL.bit.HSPCLKDIV = TB_DIV1;
+    EPwm3Regs.TBCTL.bit.CLKDIV = TB_DIV1;
+
+    EPwm3Regs.AQCTLA.bit.CAU = AQ_CLEAR;        //EPWM1A goes low when CTR=CMPA register when CTR decrementing
+    EPwm3Regs.AQCTLA.bit.CAD = AQ_SET;          //EPWM1A goes hi when CTR=CMPA register when CTR incrementing
+
+    //Deadband settings
+    EPwm3Regs.DBCTL.bit.IN_MODE =0x0; // ePWM-A for both RED and FED
+    EPwm3Regs.DBCTL.bit.OUT_MODE = DB_FULL_ENABLE; // enable Dead-band module
+    EPwm3Regs.DBCTL.bit.POLSEL = DB_ACTV_HIC; // active Hi complementary
+    EPwm3Regs.DBFED.all = 10; //Falling edge delay - based on sysclk (ePWM table 2-14)
+    EPwm3Regs.DBRED.all = 10; //Rising edge delay - based on sysclk (ePWM table
+
+    EPwm4Regs.TBPRD = N; //period-1;             // PWM frequency = 1 / period
+    EPwm4Regs.CMPA.bit.CMPA = duty*N;   // set duty 50% initially
+
+    EPwm4Regs.TBCTL.bit.CTRMODE = TB_COUNT_UPDOWN;
+
+    EPwm4Regs.TBCTL.bit.HSPCLKDIV = TB_DIV1;
+    EPwm4Regs.TBCTL.bit.CLKDIV = TB_DIV1;
+
+    EPwm4Regs.AQCTLA.bit.CAU = AQ_CLEAR;        //EPWM1A goes low when CTR=CMPA register when CTR decrementing
+    EPwm4Regs.AQCTLA.bit.CAD = AQ_SET;          //EPWM1A goes hi when CTR=CMPA register when CTR incrementing
+
+    //Deadband settings
+    EPwm4Regs.DBCTL.bit.IN_MODE =0x0; // ePWM-A for both RED and FED
+    EPwm4Regs.DBCTL.bit.OUT_MODE = DB_FULL_ENABLE; // enable Dead-band module
+    EPwm4Regs.DBCTL.bit.POLSEL = DB_ACTV_HIC; // active Hi complementary
+    EPwm4Regs.DBFED.all = 10; //Falling edge delay - based on sysclk (ePWM table 2-14)
+    EPwm4Regs.DBRED.all = 10; //Rising edge delay - based on sysclk (ePWM table
+    EDIS;
+
+}
+
+
+//
+// initADCSOC - Function to configure ADCA's SOC0 to be triggered by ePWM1.
+//
+void initADCSOC(void)
+{
+    //
+    // Select the channels to convert and the end of conversion flag
+    //
+    EALLOW;
+
+    AdcaRegs.ADCSOC0CTL.bit.CHSEL = 3;
+    AdcaRegs.ADCSOC1CTL.bit.CHSEL = 5;
+    AdcaRegs.ADCSOC2CTL.bit.CHSEL = 6;
+    AdcaRegs.ADCSOC3CTL.bit.CHSEL = 9;// SOC0 will convert pin A1
+                                           // 0:A0  1:A1  2:A2  3:A3
+                                           // 4:A4   5:A5   6:A6   7:A7
+                                           // 8:A8   9:A9   A:A10  B:A11
+                                           // C:A12  D:A13  E:A14  F:A15
+    AdcaRegs.ADCSOC4CTL.bit.CHSEL = 1;// SOC0 will convert pin A1
+                                               // 0:A0  1:A1  2:A2  3:A3
+                                               // 4:A4   5:A5   6:A6   7:A7
+                                               // 8:A8   9:A9   A:A10  B:A11
+                                               // C:A12  D:A13  E:A14  F:A15
+    AdcaRegs.ADCSOC4CTL.bit.ACQPS = 9;
+    AdcaRegs.ADCSOC4CTL.bit.TRIGSEL = 5;
+
+    AdccRegs.ADCSOC0CTL.bit.CHSEL = 1;
+    AdccRegs.ADCSOC4CTL.bit.CHSEL = 3;
+    AdccRegs.ADCSOC5CTL.bit.CHSEL = 5;
+
+
+    AdcaRegs.ADCSOC0CTL.bit.ACQPS = 9;     // Sample window is 10 SYSCLK cycles
+    AdcaRegs.ADCSOC0CTL.bit.TRIGSEL = 5;   // Trigger on ePWM1 SOCA
+    AdcaRegs.ADCSOC1CTL.bit.ACQPS = 9;     // Sample window is 10 SYSCLK cycles
+    AdcaRegs.ADCSOC1CTL.bit.TRIGSEL = 5;
+    AdcaRegs.ADCSOC2CTL.bit.ACQPS = 9;     // Sample window is 10 SYSCLK cycles
+    AdcaRegs.ADCSOC2CTL.bit.TRIGSEL = 5;
+    AdcaRegs.ADCSOC3CTL.bit.ACQPS = 9;     // Sample window is 10 SYSCLK cycles
+    AdcaRegs.ADCSOC3CTL.bit.TRIGSEL = 5;
+
+    AdccRegs.ADCSOC0CTL.bit.ACQPS = 9;     // Sample window is 10 SYSCLK cycles
+    AdccRegs.ADCSOC0CTL.bit.TRIGSEL = 5;
+    AdccRegs.ADCSOC4CTL.bit.ACQPS = 9;     // Sample window is 10 SYSCLK cycles
+    AdccRegs.ADCSOC4CTL.bit.TRIGSEL = 5;
+    AdccRegs.ADCSOC5CTL.bit.ACQPS = 9;     // Sample window is 10 SYSCLK cycles
+    AdccRegs.ADCSOC5CTL.bit.TRIGSEL = 5;
+
+
+    AdcaRegs.ADCINTSEL1N2.bit.INT1SEL = 0; // End of SOC0 will set INT1 flag
+    AdcaRegs.ADCINTSEL1N2.bit.INT1E = 1;   // Enable INT1 flag
+    AdcaRegs.ADCINTFLGCLR.bit.ADCINT1 = 1; // Make sure INT1 flag is cleared
+
+    EDIS;
+}
+
+//
+// adcA1ISR - ADC A Interrupt 1 ISR
+//
+interrupt void adcA1ISR(void)
+{
+
+    counter++;
+    AdcaRegs.ADCINTFLGCLR.bit.ADCINT1 = 1;
+/*
+    I = (float)AdcaResultRegs.ADCRESULT0*(3.3/(4096*0.0786));
+    Vout = (float)AdcaResultRegs.ADCRESULT2*(3.3/(4096*0.033));
+    Vin = (float)AdcaResultRegs.ADCRESULT1*(3.3/(4096*0.1));
+    Isa = (float)((int)AdccResultRegs.ADCRESULT3-2046.0)*0.048828125;
+    Isb = (float)((int)AdccResultRegs.ADCRESULT4-2046.0)*0.048828125;
+    Isc = (float)((int)AdccResultRegs.ADCRESULT5-2044.0)*0.048828125;
+*/
+   //I = (float)AdcaResultRegs.ADCRESULT0*(3.3/(4096*0.0786));
+   //Vout = (float)AdcaResultRegs.ADCRESULT2*(3.3/(4096*0.033));
+   //Vin = (float)AdcaResultRegs.ADCRESULT1*(3.3/(4096*0.1));
+
+    Isa = (float)((AdcaResultRegs.ADCRESULT0*3.3/4096) - 3.3/2)*(2*Imax/3.3);
+    Isb = (float)((AdcaResultRegs.ADCRESULT1*3.3/4096) - 3.3/2)*(2*Imax/3.3);
+    Isc = (float)((AdcaResultRegs.ADCRESULT2*3.3/4096) - 3.3/2)*(2*Imax/3.3);
+    angle = (float)AdcaResultRegs.ADCRESULT3*(3.3/4096)*7/3.3;
+    w_e = (float)AdcaResultRegs.ADCRESULT4*(3.3/4096)*1000/3.3;
+
+  // th_act = (float)AdccResultRegs.ADCRESULT0*(3.3/(4096*0.471428));
+
+//     Graph1[ConversionCount] = Isa;
+//     Graph2[ConversionCount] = th_act;
+//
+//        //
+//        // If 20 conversions have been logged, start over
+//        //
+//        if(ConversionCount == 9)
+//        {
+//            ConversionCount = 0;
+//        }
+//        else
+//        {
+//            ConversionCount++;
+//        }
+//
+//    int hall = (GpioDataRegs.GPBDAT.bit.GPIO33)*4+ GpioDataRegs.GPBDAT.bit.GPIO34*2+ GpioDataRegs.GPBDAT.bit.GPIO35*1; // obtain the sector info
+//
+//     sector[k] = HallLookup[hall];
+//       if (sector[k] != sector[k-1])  // it stays in the same hextant
+//       {
+//
+//          th[k-1]  = 0;
+//          counter2++;            // Increase a timing counter
+//          if(counter2>=2)         // I am averaging over a pole pair, means I estimate omega once it sees every north pole
+//          {
+//            w_est[k] = 2*2*pi/(counter*Tsamp*6);      // speed in electrical rad/sec
+//            counter  = 0;
+//            counter2 = 0;
+//          }
+//       }
+//
+//
+//
+//    th[k] = 0.5*Tsamp*(w_est[k] + w_est[k-1]) +th[k-1] ;  // integrate the omega to obtain theta
+//
+//      if(th[k]>(2*pi/6))
+//           {
+//              th[k]=2*pi/6;
+//           }
+//
+//      angle =  (sector[k]-1)*(2*pi/6) + th[k];  // Get  the angle estimate by adding the crude sector info with the fine angle calculated
+//      angle =  angle-pi/6;  // We need to subtract thirty degrees because the d axis has to be aligned with the A axis.
+    //  angle = th_act;
+   //   Isd =  (2/3)*(Isa*cos(angle)+Isb*(-0.5*cos(angle)+0.866*sin(angle))+Isc*(-0.5*cos(angle)-0.866*sin(angle)));
+   //   Isq = -(2/3)*(-Isa*sin(angle)+Isb*(0.5*sin(angle)+0.866*cos(angle))+Isc*(0.5*sin(angle)-0.866*cos(angle)));
+    //  Isd =  0.66667*(Isa*cos(angle)+Isb*(-0.5*cos(angle)+0.866*sin(angle))+Isc*(-0.5*cos(angle)-0.866*sin(angle)));
+    //  Isq = -0.66667*(-Isa*sin(angle)+Isb*(0.5*sin(angle)+0.866*cos(angle))+Isc*(0.5*sin(angle)-0.866*cos(angle)));
+
+      Isd =  0.66667*(Isa*cos(angle)+Isb*cos(angle-al)+Isc*cos(angle+al));
+      Isq = -0.66667*(Isa*sin(angle)+Isb*sin(angle-al)+Isc*sin(angle+al));
+
+      if(wt>2*pi)
+         {
+             wt=0;
+         }
+         wt = wt  + (2*pi/2000);   //4000 = 20000/5  This means we want 5 Hz sinusoid.   10000/5 = 2000
+
+         // omega control
+
+         e_omega[k] = omega_ref*24 - w_e;
+
+         y_omega[k] = KI_omega*0.5*Tsamp*(e_omega[k] + e_omega[k-1]) + y_omega[k-1];
+
+         Isqref = (KP_omega*e_omega[k]+ y_omega[k])*(4/(3*24*0.0394));
+
+         if(Isqref > 4.0)
+         {
+             Isqref = 4.0;
+         }
+         else if(Isqref< 0)
+         {
+             Isqref = 0.0;
+         }
+
+
+         // d and q axis current control
+            eIsd[k] = Isdref-Isd;
+            eIsq[k] = Isqref-Isq;
+
+            yIsd[k] = KI*0.5*Tsamp*(eIsd[k] + eIsd[k-1]) + yIsd[k-1];
+            yIsq[k] = KI*0.5*Tsamp*(eIsq[k] + eIsq[k-1]) + yIsq[k-1];
+
+             if (yIsd[k]>= 50)
+                {
+                    yIsd[k] = 50;
+                }
+                else if (yIsd[k] <=-50)
+                {
+                    yIsd[k] = -50;
+                }
+             if (yIsq[k]>= 50)
+                {
+                    yIsq[k] = 50;
+                }
+                else if (yIsq[k] <=-50)
+                {
+                    yIsq[k] = -50;
+                }
+
+             vsd = KP*eIsd[k]+ yIsd[k] -L23*w_e*Isq;
+             vsq = KP*eIsq[k]+ yIsq[k] +L23*w_e *Isq +w_e*0.0394;
+            // vsd = KP*eIsd[k]+ yIsd[k]-L23*w_est[k]*Isq;
+            // vsq = KP*eIsq[k]+ yIsq[k]+L23*w_est[k]*Isd;
+
+             if (vsd>=50)
+                {
+                    vsd = 50;
+                }
+            else if (vsd <=-50)
+                {
+                    vsd =-50;
+                }
+             if (vsq>=50)
+                {
+                    vsq = 50;
+                }
+            else if (vsq <=-50)
+                {
+                    vsq =-50;
+                }
+
+             vsa = (vsd*cos(angle)-vsq*sin(angle))/Vin;
+             vsb = (vsd*cos(angle-al)-vsq*sin(angle-al))/Vin;
+             vsc = (vsd*cos(angle+al)-vsq*sin(angle+al))/Vin;
+
+/*
+            if (vsa>=0.98)
+            {
+                vsa = 0.98;
+            }
+            else if (vsa <=-0.98)
+            {
+                vsa =-0.98;
+            }
+            if (vsb>=0.98)
+                   {
+                       vsb = 0.98;
+                   }
+                   else if (vsb <=-0.98)
+                   {
+                       vsb = -0.98;
+                   }
+            if (vsc>=0.98)
+                   {
+                       vsc = 0.98;
+                   }
+                   else if (vsc <=-0.98)
+                   {
+                       vsc = -0.98;
+                   }
+*/
+
+/*
+    // Boost voltage controller
+    ev[k] = Vref-Vout;
+    yv[k] = Kiv*0.5*Tsamp*(ev[k] + ev[k-1]) + yv[k-1];
+    if (yv[k]>=12)
+         {
+             yv[k] = 12;
+         }
+         else if (yv[k] <=-12)
+         {
+             yv[k] = -12;
+         }
+    // Boost current controller
+    Iref  = Kpv*ev[k]+ yv[k];
+    ec[k] = Iref-I;
+    yc[k] = Kic*0.5*Tsamp*(ec[k] + ec[k-1]) + yc[k-1];
+     if (yc[k]>=1)
+        {
+            yc[k] = 1;
+        }
+        else if (yc[k] <=-1)
+        {
+            yc[k] = -1;
+        }
+     duty = Kpc*ec[k]+ yc[k];
+
+    if (duty>=0.98)
+    {
+        duty = 0.98;
+    }
+    else if (duty <=0.02)
+    {
+        duty = 0.02;
+    }
+*/
+
+    //Inverter part
+
+
+    EPwm1Regs.CMPA.bit.CMPA = duty*N;
+    EPwm2Regs.CMPA.bit.CMPA = (0.5+ 0.5*vsa)*N;
+    EPwm3Regs.CMPA.bit.CMPA = (0.5+ 0.5*vsb)*N;
+    EPwm4Regs.CMPA.bit.CMPA = (0.5+ 0.5*vsc)*N;
+
+
+    /*
+     *   EPwm1Regs.CMPA.bit.CMPA = duty*N;
+    EPwm2Regs.CMPA.bit.CMPA = (0.5+ 0.5*mod_index*sin(wt))*N;
+    EPwm3Regs.CMPA.bit.CMPA = (0.5+ 0.5*mod_index*sin(wt-al))*N;
+    EPwm4Regs.CMPA.bit.CMPA = (0.5+ 0.5*mod_index*sin(wt+al))*N;
+     *
+     */
+    /*
+    ec[k-1]     = ec[k];
+    yc[k-1]     = yc[k];
+    ev[k-1]     = ev[k];
+    yv[k-1]     = yv[k];
+    */
+    sector[k-1] = sector[k];
+    th[k-1]     = th[k];
+    w_est[k-1]  = w_est[k];
+    eIsd[k-1]   = eIsd[k];
+    eIsq[k-1]   = eIsq[k];
+    yIsd[k-1]     = yIsd[k];
+    yIsq[k-1]     = yIsq[k];
+    e_omega[k-1] = e_omega[k];
+    y_omega[k-1] = y_omega[k];
+
+    if(1 == AdcaRegs.ADCINTOVF.bit.ADCINT1)
+    {
+        AdcaRegs.ADCINTOVFCLR.bit.ADCINT1 = 1; //clear INT1 overflow flag
+        AdcaRegs.ADCINTFLGCLR.bit.ADCINT1 = 1; //clear INT1 flag
+    }
+
+    //
+    // Acknowledge the interrupt
+    //
+    PieCtrlRegs.PIEACK.all = PIEACK_GROUP1;
+}
+
+void setup1GPIO(void)
+{
+    //
+    // Example 1: Basic Pinout.
+    // This basic pinout includes:
+    // PWM1-3, ECAP1, ECAP2, TZ1-TZ4, SPI-A, EQEP1, SCI-A, CAN-A, I2C
+    // and a number of I/O pins
+    // These can be combined into single statements for improved
+    // code efficiency.
+    //
+
+    //
+    // Enable PWM1-3 on GPIO0-GPIO5
+    //
+    EALLOW;
+       GpioCtrlRegs.GPAPUD.bit.GPIO0 = 1;    // Disable pull-up on GPIO0 (EPWM1A)
+       GpioCtrlRegs.GPAPUD.bit.GPIO1 = 1;    // Disable pull-up on GPIO1 (EPWM1B)
+
+
+       GpioCtrlRegs.GPAMUX1.bit.GPIO0 = 1;   // Configure GPIO0 as EPWM1A
+       GpioCtrlRegs.GPAMUX1.bit.GPIO1 = 1;   // Configure GPIO1 as EPWM1B
+
+       GpioCtrlRegs.GPAPUD.bit.GPIO2 = 1;    // Disable pull-up on GPIO0 (EPWM2A)
+       GpioCtrlRegs.GPAMUX1.bit.GPIO2 = 1;   // Configure GPIO0 as EPWM2A
+
+       GpioCtrlRegs.GPAPUD.bit.GPIO3 = 1;    // Disable pull-up on GPIO0 (EPWM2B)
+       GpioCtrlRegs.GPAMUX1.bit.GPIO3 = 1;   // Configure GPIO0 as EPWM2A
+
+       GpioCtrlRegs.GPAPUD.bit.GPIO4 = 1;    // Disable pull-up on GPIO0 (EPWM3A)
+       GpioCtrlRegs.GPAMUX1.bit.GPIO4 = 1;   // Configure GPIO0 as EPWM3A
+
+       GpioCtrlRegs.GPAPUD.bit.GPIO5 = 1;    // Disable pull-up on GPIO0 (EPWM3B)
+       GpioCtrlRegs.GPAMUX1.bit.GPIO5 = 1;   // Configure GPIO0 as EPWM3A
+
+       GpioCtrlRegs.GPAPUD.bit.GPIO6 = 1;    // Disable pull-up on GPIO0 (EPWM4A)
+       GpioCtrlRegs.GPAMUX1.bit.GPIO6 = 1;   // Configure GPIO0 as EPWM4A
+
+       GpioCtrlRegs.GPAPUD.bit.GPIO7 = 1;    // Disable pull-up on GPIO0 (EPWM4B)
+       GpioCtrlRegs.GPAMUX1.bit.GPIO7 = 1;   // Configure GPIO0 as EPWM4B
+    /*
+       GpioCtrlRegs.GPAPUD.bit.GPIO8 = 0;   // Enable pullup on GPIO6
+       GpioDataRegs.GPASET.bit.GPIO8 = 1;   // Load output latch
+       GpioCtrlRegs.GPAMUX1.bit.GPIO8 = 0;  // GPIO6 = GPIO6
+       GpioCtrlRegs.GPADIR.bit.GPIO8 = 1;   // GPIO6 = output
+
+       GpioCtrlRegs.GPAPUD.bit.GPIO9 = 0;   // Enable pullup on GPIO6
+       GpioDataRegs.GPASET.bit.GPIO9 = 1;   // Load output latch
+       GpioCtrlRegs.GPAMUX1.bit.GPIO9 = 0;  // GPIO9 = GPIO9
+       GpioCtrlRegs.GPADIR.bit.GPIO9 = 1;   // GPIO9 = output
+
+       GpioCtrlRegs.GPAPUD.bit.GPIO10 = 0;   // Enable pullup on GPIO6
+       GpioDataRegs.GPASET.bit.GPIO10 = 1;   // Load output latch
+       GpioCtrlRegs.GPAMUX1.bit.GPIO10 = 0;  // GPIO10 = GPIO10
+       GpioCtrlRegs.GPADIR.bit.GPIO10 = 1;   // GPIO10 = output
+       */
+
+    GpioCtrlRegs.GPBMUX1.bit.GPIO33= 0;  // GPIO6 = GPIO6
+    GpioCtrlRegs.GPBDIR.bit.GPIO33 = 0;   // GPIO6 = input
+
+    GpioCtrlRegs.GPBMUX1.bit.GPIO34= 0;  // GPIO6 = GPIO6
+    GpioCtrlRegs.GPBDIR.bit.GPIO34 = 0;   // GPIO6 = input.
+
+    GpioCtrlRegs.GPBMUX1.bit.GPIO35= 0;  // GPIO6 = GPIO6
+    GpioCtrlRegs.GPBDIR.bit.GPIO35 = 0;   // GPIO6 = input
+    EDIS;
+}
+
+//
+// End of File
+//

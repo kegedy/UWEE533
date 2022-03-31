@@ -1,0 +1,541 @@
+//#############################################################################
+//
+// FILE:   adc_ex1_soc_epwm.c
+//
+// TITLE:  ADC ePWM Triggering
+//
+//! \addtogroup bitfield_example_list
+//! <h1>ADC ePWM Triggering</h1>
+//!
+//! This example sets up ePWM1 to periodically trigger a conversion on ADCA.
+//!
+//! \b External \b Connections \n
+//!  - A1 should be connected to a signal to convert
+//!
+//! \b Watch \b Variables \n
+//! - \b adcAResults - A sequence of analog-to-digital conversion samples from
+//!   pin A1. The time between samples is determined based on the period
+//!   of the ePWM timer.
+//!
+//
+//#############################################################################
+// $TI Release: F28004x Support Library v1.11.00.00 $
+// $Release Date: Sun Oct  4 15:49:15 IST 2020 $
+// $Copyright:
+// Copyright (C) 2020 Texas Instruments Incorporated - http://www.ti.com/
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+//
+//   Redistributions of source code must retain the above copyright
+//   notice, this list of conditions and the following disclaimer.
+//
+//   Redistributions in binary form must reproduce the above copyright
+//   notice, this list of conditions and the following disclaimer in the
+//   documentation and/or other materials provided with the
+//   distribution.
+//
+//   Neither the name of Texas Instruments Incorporated nor the names of
+//   its contributors may be used to endorse or promote products derived
+//   from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// $
+//#############################################################################
+
+//
+// Included Files
+//
+#include "F28x_Project.h"
+#include <math.h>
+#include <stdio.h>
+
+//
+// Defines
+//
+#define RESULTS_BUFFER_SIZE     256
+#define pi                      3.141592653589
+#define fsw 10000.0 //10kHz, given
+#define kpi  0.1473
+#define kii  534.0617
+#define kpv  0.2049
+#define kiv  222.8951
+
+//
+// Globals
+//
+uint16_t adcAResults[RESULTS_BUFFER_SIZE];   // Buffer for results
+uint16_t index;                              // Index into result buffer
+volatile uint16_t bufferFull;                // Flag to indicate buffer is full
+//used for Task 3.3
+float duty = 0.5;
+float dt = 0.0;
+float Wn = 100.0*2.0*pi;
+float m = 0.5;
+float Ts = 1.0/(fsw);
+int N = 5000;
+unsigned long adcARead = 0;
+
+float iADC;
+float VinADC;
+float VoADC;
+
+float iL;
+float vin;
+float vo;
+
+float xi_now = 0;
+float yi_now = 0;
+float yi_prev = 0;
+float xi_prev = 0;
+
+float xv_now = 0;
+float yv_now = 0;
+float yv_prev = 0;
+float xv_prev = 0;
+
+float Ki_scale = 12;
+float Kvi_scale = 30;
+float Kvo_scale = 60;
+
+float i_err;
+float i_err_prev;
+float i_ref;
+float i_adc_normal = 0;
+float yipr;
+float yiint;
+float yi_int_min = -0.95;
+float yi_int_max = 0.95;
+float yi_max = 0.95;
+float yi_min = 0.05;
+float yi;
+
+float v_err;
+float v_err_prev;
+float v_ref = 48;
+float v_adc_normal = 0;
+float yvpr;
+float yvint;
+float yv_int_max = 12;
+float yv_int_min = -12;
+float yv_max = 12;
+float yv_min = 0;
+float yv;
+int count = 0;
+
+
+
+//
+// Function Prototypes
+//
+void initADC(void);
+void initEPWM(void);
+void initADCSOC(void);
+__interrupt void adcA1ISR(void);
+
+//
+// Main
+//
+void main(void)
+{
+
+    //
+    // Initialize device clock and peripherals
+    //
+    InitSysCtrl();
+    //
+    // Initialize GPIO
+    //
+    InitGpio();
+
+    //
+    // Disable CPU interrupts
+    //
+    DINT;
+
+    //
+    // Initialize the PIE control registers to their default state.
+    // The default state is all PIE interrupts disabled and flags
+    // are cleared.
+    //
+    InitPieCtrl();
+
+    //
+    // Disable CPU interrupts and clear all CPU interrupt flags:
+    //
+    IER = 0x0000;
+    IFR = 0x0000;
+
+    //
+    // Initialize the PIE vector table with pointers to the shell Interrupt
+    // Service Routines (ISR).
+    //
+    InitPieVectTable();
+
+    //
+    // Map ISR functions
+    //
+    EALLOW;
+    PieVectTable.ADCA1_INT = &adcA1ISR;     // Function for ADCA interrupt 1
+
+    /* Init DAC here per instruction
+     *
+     *
+     */
+    DacaRegs.DACCTL.bit.DACREFSEL = 0b1;
+    DacaRegs.DACCTL.bit.LOADMODE = 0b0;
+    DacaRegs.DACCTL.bit.MODE = 1;
+    DacaRegs.DACVALA.all = 0;
+    DacaRegs.DACOUTEN.bit.DACOUTEN = 0b1;
+
+    DacbRegs.DACCTL.bit.DACREFSEL = 0b1;
+    DacbRegs.DACCTL.bit.LOADMODE = 0b0;
+    DacbRegs.DACCTL.bit.MODE = 1;
+    DacbRegs.DACVALA.all = 0;
+    DacbRegs.DACOUTEN.bit.DACOUTEN = 0b1;
+    EDIS;
+
+    //
+    // Configure the ADC and power it up
+    //
+    initADC();
+
+    //
+    // Configure the ePWM
+    //
+    initEPWM();
+
+
+
+
+
+    //
+    // Setup the ADC for ePWM triggered conversions on channel 1
+    //
+    initADCSOC();
+
+    //
+    // Enable global Interrupts and higher priority real-time debug events:
+    //
+    IER |= M_INT1;  // Enable group 1 interrupts
+
+    EINT;           // Enable Global interrupt INTM
+    ERTM;           // Enable Global realtime interrupt DBGM
+
+    //
+    // Initialize results buffer
+    //
+    for(index = 0; index < RESULTS_BUFFER_SIZE; index++)
+    {
+        adcAResults[index] = 0;
+    }
+
+    index = 0;
+    bufferFull = 0;
+
+    //
+    // Enable PIE interrupt
+    //
+    PieCtrlRegs.PIEIER1.bit.INTx1 = 1;
+
+    //
+    // Sync ePWM
+    //
+    EALLOW;
+    CpuSysRegs.PCLKCR0.bit.TBCLKSYNC = 1;
+
+    //
+    // Take conversions indefinitely in loop
+    //
+    while(1)
+    {
+        //
+        // Start ePWM
+        //
+//        EPwm1Regs.ETSEL.bit.SOCAEN = 1;    // Enable SOCA
+//        EPwm1Regs.TBCTL.bit.CTRMODE = 0;   // Unfreeze, and enter up count mode
+
+        //
+        // Wait while ePWM causes ADC conversions, which then cause interrupts,
+        // which fill the results buffer, eventually setting the bufferFull
+        // flag
+        //
+/* REMOVE FROM LAB BASED ON INSTRUCTION ********************
+//        while(!bufferFull)
+//        {
+//        }
+//        bufferFull = 0; //clear the buffer full flag
+//
+//        //
+//        // Stop ePWM
+//        //
+//        EPwm1Regs.ETSEL.bit.SOCAEN = 0;    // Disable SOCA
+//        EPwm1Regs.TBCTL.bit.CTRMODE = 3;   // Freeze counter
+**********************************************************/
+        //
+        // Software breakpoint. At this point, conversion results are stored in
+        // adcAResults.
+        //
+        // Hit run again to get updated conversions.
+        //
+        //ESTOP0;
+    }
+}
+
+//
+// initADC - Function to configure and power up ADCA.
+//
+void initADC(void)
+{
+    //
+    // Setup VREF as internal
+    //
+    SetVREF(ADC_ADCA, ADC_INTERNAL, ADC_VREF3P3);
+
+    EALLOW;
+
+    //
+    // Set ADCCLK divider to /4
+    //
+    AdcaRegs.ADCCTL2.bit.PRESCALE = 6;
+
+    //
+    // Set pulse positions to late
+    //
+    AdcaRegs.ADCCTL1.bit.INTPULSEPOS = 1;
+
+    //
+    // Power up the ADC and then delay for 1 ms
+    //
+    AdcaRegs.ADCCTL1.bit.ADCPWDNZ = 1;
+    EDIS;
+
+    DELAY_US(1000);
+}
+
+//
+// initEPWM - Function to configure ePWM1 to generate the SOC.
+//
+void initEPWM(void)
+{
+   EALLOW;
+//
+//    EPwm1Regs.ETSEL.bit.SOCAEN = 0;     // Disable SOC on A group
+//    EPwm1Regs.ETSEL.bit.SOCASEL = 4;    // Select SOC on up-count
+//    EPwm1Regs.ETPS.bit.SOCAPRD = 1;     // Generate pulse on 1st event
+//
+//    EPwm1Regs.CMPA.bit.CMPA = 0x0800;   // Set compare A value to 2048 counts
+//    EPwm1Regs.TBPRD = 0x1000;           // Set period to 4096 counts
+//
+//    EPwm1Regs.TBCTL.bit.CTRMODE = 3;    // Freeze counter
+
+    //TBClk = Sysclck / (HSPCLKDIV x CLKDIV) = Sysclk = 100Mhz
+    EPwm1Regs.TBCTL.bit.HSPCLKDIV = 0b000; //set to 1
+    EPwm1Regs.TBCTL.bit.CLKDIV = 0b000; //set to 1
+    EPwm1Regs.TBCTL.bit.CTRMODE = 0b10; //set to up-down-counter
+    //TODO: SET TBPRD AS #define
+    EPwm1Regs.TBPRD = N; //T_PWM = 2*TBPRD*TBCLLK -> 100us = 2*TBPRD*0.01us -> TBPRD = ********************
+    EPwm1Regs.AQCTLA.bit.CAD = 0b10;
+    EPwm1Regs.AQCTLA.bit.CAU = 0b01;
+    EPwm1Regs.DBCTL.bit.IN_MODE = 0b0; //set IN_MODE = 00;
+    EPwm1Regs.DBCTL.bit.POLSEL = 0b10;//set POLSEL = 10
+    EPwm1Regs.DBCTL.bit.OUT_MODE = 3;
+    //DBRED & DBFED initialization
+    EPwm1Regs.DBFED.bit.DBFED = 100;
+    EPwm1Regs.DBRED.bit.DBRED = 100;
+
+    /*
+     * insert code from lab 2 section here
+     */
+    //implement Peak/Valley Sampling
+    EPwm1Regs.ETSEL.bit.SOCAEN = 0b1;
+    EPwm1Regs.ETSEL.bit.SOCASEL = 0b011;
+    EPwm1Regs.ETPS.bit.INTPRD = 0b1;
+    EPwm1Regs.ETPS.bit.SOCAPRD = 0b1;
+
+    //Enable PWM on GPIO0 and 1
+    GpioCtrlRegs.GPAMUX1.bit.GPIO0 = 0b1;
+    GpioCtrlRegs.GPAMUX1.bit.GPIO1 = 0b1;
+    GpioCtrlRegs.GPAPUD.bit.GPIO0 = 0b1;
+    GpioCtrlRegs.GPAPUD.bit.GPIO1 = 0b1;
+
+    EDIS;
+}
+
+//
+// initADCSOC - Function to configure ADCA's SOC0 to be triggered by ePWM1.
+//
+void initADCSOC(void)
+{
+    //
+    // Select the channels to convert and the end of conversion flag
+    //
+    EALLOW;
+
+    AdcaRegs.ADCSOC0CTL.bit.CHSEL = 0x3;     // SOC0 will convert pin A3
+    AdcaRegs.ADCSOC0CTL.bit.ACQPS = 0x09;     // Sample window is 10 SYSCLK cycles
+    AdcaRegs.ADCSOC0CTL.bit.TRIGSEL = 0x05;   // Trigger on ePWM1 SOCA
+
+    AdcaRegs.ADCSOC1CTL.bit.CHSEL = 0x05; // SOC0 will convert pin A5
+    AdcaRegs.ADCSOC1CTL.bit.ACQPS = 0x09;     // Sample window is 10 SYSCLK cycles
+    AdcaRegs.ADCSOC1CTL.bit.TRIGSEL = 0x05;   // Trigger on ePWM1 SOCA
+
+    AdcaRegs.ADCSOC2CTL.bit.CHSEL = 0x06; // SOC0 will convert pin A6
+    AdcaRegs.ADCSOC2CTL.bit.ACQPS = 0x09;     // Sample window is 10 SYSCLK cycles
+    AdcaRegs.ADCSOC2CTL.bit.TRIGSEL = 0x05;   // Trigger on ePWM1 SOCA
+
+    AdcaRegs.ADCINTSEL1N2.bit.INT1SEL = 0; // End of SOC0 will set INT1 flag
+    AdcaRegs.ADCINTSEL1N2.bit.INT1E = 1;   // Enable INT1 flag
+    AdcaRegs.ADCINTFLGCLR.bit.ADCINT1 = 1; // Make sure INT1 flag is cleared
+
+    EDIS;
+}
+
+//
+// adcA1ISR - ADC A Interrupt 1 ISR
+//
+__interrupt void adcA1ISR(void)
+{
+    count++;
+    //
+    // Add the latest result to the buffer
+    // ADCRESULT0 is the result register of SOC0
+
+    //For Task 4.4
+//    x_now = AdcaResultRegs.ADCRESULT1;
+//    y_now = (Ts * 0.5) * 0.5 * (x_now + x_prev) + y_prev;
+//    if (y_now>0b111111111111) {
+//        y_now = 0;
+//    }
+//    x_prev = x_now;
+//    y_prev = y_now;
+//    DacbRegs.DACVALS.all = y_now;
+
+    //Lab 2 ADC Scaling
+    //EPwm1Regs.CMPA.bit.CMPA = duty*N; //Used for task 3.3 //N = 5000 = TBPRD
+    iADC = AdcaResultRegs.ADCRESULT0;
+    VinADC = AdcaResultRegs.ADCRESULT1;
+    VoADC = AdcaResultRegs.ADCRESULT2;
+
+    iL = (float)iADC * (3.3/4096.0)*(Ki_scale / 3.3);
+    vin = (float)VinADC * (3.3/4096.0)*(Kvi_scale / 3.3);
+    vo = (float)VoADC * (3.3/4096.0)*(Kvo_scale / 3.3);
+
+    //Lab 2 Voltage Controller
+    v_err = v_ref - vo;                       //Error current signal
+    yvpr = v_err * kpv;                                  //kp is proportional gain. Proportional step
+
+    yvint = (Ts/2)*(0.5)*(v_err+v_err_prev)*kiv+yv_prev;    //Integration
+
+    if(yvint<yv_int_min)             //Upper and lower limits for integrator
+    {
+       yvint=yv_int_min;
+    }
+
+    else if(yvint>yv_int_max)
+    {
+       yvint=yv_int_max;
+    }
+
+    yv_prev = yvint;           //Need previous step information
+    v_err_prev = v_err;
+
+    yv = yvint + yvpr;           //controller output = sum of proportional + integration steps
+
+
+
+    if(yv<yv_min)             //Upper and lower limits for controller
+    {
+       yv=yv_min;
+    }
+
+    else if(yv>yv_max)
+    {
+       yv=yv_max;
+    }
+
+    i_ref = yv;
+
+    //Lab 2 Current Controller
+    i_err = i_ref - iL;                       //Error current signal
+    yipr = i_err * kpi;                                  //kp is proportional gain. Proportional step
+
+    yiint = (Ts/2)*(0.5)*(i_err+i_err_prev)*kii+yi_prev;    //Integration
+
+    if(yiint<yi_int_min)             //Upper and lower limits for integrator
+    {
+       yiint=yi_int_min;
+    }
+
+    else if(yiint>yi_int_max)
+    {
+       yiint=yi_int_max;
+    }
+
+    yi_prev = yiint;           //Need previous step information
+    i_err_prev = i_err;
+
+    yi = yiint +yipr;           //controller output = sum of proportional + integration steps
+
+
+
+    if(yi<yi_min)             //Upper and lower limits for controller
+    {
+       yi=yi_min;
+    }
+
+    else if(yi>yi_max)
+    {
+       yi=yi_max;
+    }
+
+    duty = yi;
+
+    EPwm1Regs.CMPA.bit.CMPA = duty*N;
+
+
+
+    //
+    // Set the bufferFull flag if the buffer is full
+    //
+/* Removed per instruction *********
+//    if(RESULTS_BUFFER_SIZE <= index)
+//    {
+//        index = 0;
+//        bufferFull = 1;
+//    }
+*****************************************/
+    //
+    // Clear the interrupt flag
+    //
+    AdcaRegs.ADCINTFLGCLR.bit.ADCINT1 = 1;
+
+    //
+    // Check if overflow has occurred
+    //
+    if(1 == AdcaRegs.ADCINTOVF.bit.ADCINT1)
+    {
+        AdcaRegs.ADCINTOVFCLR.bit.ADCINT1 = 1; //clear INT1 overflow flag
+        AdcaRegs.ADCINTFLGCLR.bit.ADCINT1 = 1; //clear INT1 flag
+    }
+
+    //
+    // Acknowledge the interrupt
+    //
+    PieCtrlRegs.PIEACK.all = PIEACK_GROUP1;
+}
+
+//
+// End of File
+//
